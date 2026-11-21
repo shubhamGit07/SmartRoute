@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   MapContainer,
   TileLayer,
@@ -34,13 +34,12 @@ import {
 } from "lucide-react";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
+import { io } from "socket.io-client";
 import "./styles.css";
-
 /* =====================================================
    CONSTANTS & HELPERS
 ===================================================== */
-
-const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:4000";
+const API_BASE = (import.meta.env.VITE_API_URL || (import.meta.env.DEV ? "" : "http://localhost:4000")).replace(/\/+$/, "");
 const DEFAULT_CENTER = [28.6139, 77.209];
 const STATUS_FLOW = ["PENDING", "ACCEPTED", "PICKED_UP", "IN_TRANSIT", "DELIVERED"];
 const NEXT_STATUS = {
@@ -59,14 +58,11 @@ const BASE_FARE = 35;
 const PER_KM = 10;
 const EXPRESS_FEE = 25;
 const PAGE_SIZE = 8;
-
 const statusLabel = (s) =>
   s ? s.replaceAll("_", " ").toLowerCase().replace(/^./, (c) => c.toUpperCase()) : "Unknown";
-
 const shortId = (id) => (id ? `#${String(id).slice(0, 6)}` : "—");
 const fmtKm = (v) => (Number.isFinite(Number(v)) && v !== null && v !== undefined ? `${Number(v).toFixed(2)} km` : "—");
 const fmtMs = (v) => (Number.isFinite(Number(v)) && v !== null && v !== undefined ? `${Number(v).toFixed(1)} ms` : "—");
-
 /* (fifo - optimized) / fifo * 100 */
 const reductionPct = (fifo, opt) => {
   const f = Number(fifo);
@@ -74,7 +70,6 @@ const reductionPct = (fifo, opt) => {
   if (!Number.isFinite(f) || !Number.isFinite(o) || f <= 0) return null;
   return ((f - o) / f) * 100;
 };
-
 const makeIcon = (kind, letter) =>
   new L.DivIcon({
     className: "",
@@ -84,12 +79,11 @@ const makeIcon = (kind, letter) =>
   });
 const pickupIcon = makeIcon("pickup", "P");
 const dropIcon = makeIcon("drop", "D");
-
 async function reverseGeocode(lat, lng) {
   const fallback = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
   try {
     const res = await fetch(
-      `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}`
+      `${API_BASE}/api/reverse?lat=${lat}&lng=${lng}`
     );
     if (!res.ok) return fallback;
     const data = await res.json();
@@ -98,21 +92,17 @@ async function reverseGeocode(lat, lng) {
     return fallback;
   }
 }
-
 /* =====================================================
    SHARED UI PIECES
 ===================================================== */
-
 function StatusBadge({ status }) {
   const key = STATUS_FLOW.includes(status) ? status.toLowerCase() : "unknown";
   return <span className={`badge s-${key}`}>{statusLabel(status)}</span>;
 }
-
 function PriorityBadge({ priority }) {
   const p = String(priority || "standard").toLowerCase();
   return <span className={`badge plain ${p === "express" ? "express" : "standard"}`}>{p === "express" ? "Express" : "Standard"}</span>;
 }
-
 function Kpi({ label, value, hint, loading, good }) {
   return (
     <div className={`card kpi ${good ? "good" : ""}`}>
@@ -122,7 +112,6 @@ function Kpi({ label, value, hint, loading, good }) {
     </div>
   );
 }
-
 function Empty({ icon: Icon = Inbox, title, text, action }) {
   return (
     <div className="empty">
@@ -133,7 +122,6 @@ function Empty({ icon: Icon = Inbox, title, text, action }) {
     </div>
   );
 }
-
 function ErrorBanner({ message, onRetry }) {
   if (!message) return null;
   return (
@@ -148,7 +136,6 @@ function ErrorBanner({ message, onRetry }) {
     </div>
   );
 }
-
 function Toasts({ items }) {
   return (
     <div className="toasts" aria-live="polite">
@@ -161,7 +148,6 @@ function Toasts({ items }) {
     </div>
   );
 }
-
 function Modal({ title, onClose, children, footer }) {
   useEffect(() => {
     const onKey = (e) => e.key === "Escape" && onClose();
@@ -183,7 +169,6 @@ function Modal({ title, onClose, children, footer }) {
     </div>
   );
 }
-
 /* keeps Leaflet correct when the layout resizes (mobile / sidebar / rotate) */
 function MapSizer() {
   const map = useMap();
@@ -195,7 +180,6 @@ function MapSizer() {
   }, [map]);
   return null;
 }
-
 function OsmTiles() {
   return (
     <TileLayer
@@ -204,11 +188,9 @@ function OsmTiles() {
     />
   );
 }
-
 /* =====================================================
    DATA HOOK (rider + admin + research share one source)
 ===================================================== */
-
 function useBackend(active) {
   const [orders, setOrders] = useState([]);
   const [riders, setRiders] = useState([]);
@@ -217,7 +199,6 @@ function useBackend(active) {
   const [loading, setLoading] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState("");
-
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     setError("");
@@ -242,7 +223,6 @@ function useBackend(active) {
         ridersRes.ok ? ridersRes.json() : Promise.resolve([]),
         riderOrdersRes.ok ? riderOrdersRes.json() : Promise.resolve([]),
       ]);
-
       // Merge both public order feeds by ID, then keep the newest orders first.
       const mergedOrders = new Map();
       [ordersData, riderOrdersData].forEach((list) => {
@@ -254,39 +234,37 @@ function useBackend(active) {
       setHistory(Array.isArray(historyData) ? historyData : []);
       setOrders([...mergedOrders.values()].sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)));
       setRiders(Array.isArray(ridersData) ? ridersData : []);
-
       const failed = [routesRes, historyRes, ordersRes, ridersRes, riderOrdersRes].filter((r) => !r.ok);
       if (failed.length) console.warn('Some SmartRoute endpoints returned errors:', failed.map((r) => r.status));
     } catch (e) {
       console.error(e);
-      setError(e?.message ? `${e.message} — API: ${API_BASE}` : `Can't reach the SmartRoute backend at ${API_BASE}. Check that the server is running.`);
+      setError("The server may be waking up (free hosting sleeps when idle). Retrying…");
+      setTimeout(() => load(true), 6000);
     } finally {
       setLoading(false);
       setLoaded(true);
     }
   }, []);
-
-
   useEffect(() => {
     if (!active) return undefined;
     load();
-    const t = setInterval(() => load(true), 15000);
-    return () => clearInterval(t);
+    // Socket.io pushes (debounced) -> instant UI; polling is only a slow safety net.
+    let debounce;
+    const refresh = () => { clearTimeout(debounce); debounce = setTimeout(() => load(true), 400); };
+    const socket = io(API_BASE || undefined, { transports: ["websocket", "polling"], reconnectionDelayMax: 10000 });
+    ["orders:update", "routes:update", "rider:location"].forEach((ev) => socket.on(ev, refresh));
+    const t = setInterval(() => load(true), 30000);
+    return () => { clearTimeout(debounce); clearInterval(t); socket.disconnect(); };
   }, [active, load]);
-
-
   return { orders, riders, routes, history, loading, loaded, error, load };
 }
-
 /* =====================================================
    CUSTOMER PORTAL
 ===================================================== */
-
 function MapClicks({ mode, onPick }) {
   useMapEvents({ click: (e) => onPick(e.latlng, mode) });
   return null;
 }
-
 function FitView({ pickup, drop, route }) {
   const map = useMap();
   useEffect(() => {
@@ -302,30 +280,24 @@ function FitView({ pickup, drop, route }) {
   }, [pickup, drop, route, map]);
   return null;
 }
-
 function CustomerPortal({ toast, onBooked }) {
   const [pickup, setPickup] = useState(null);
   const [drop, setDrop] = useState(null);
   const [mode, setMode] = useState("pickup");
-
   const [query, setQuery] = useState("");
   const [results, setResults] = useState([]);
   const [searching, setSearching] = useState(false);
-
   const [route, setRoute] = useState(null);
   const [routing, setRouting] = useState(false);
   const [routeError, setRouteError] = useState("");
   const [routeTick, setRouteTick] = useState(0);
-
   const [item, setItem] = useState("Package");
   const [priority, setPriority] = useState("standard");
   const [touched, setTouched] = useState(false);
-
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [booked, setBooked] = useState(null);
-
   /* ---- fare (same formula as before, itemised) ---- */
   const fare = useMemo(() => {
     if (!route || !pickup || !drop) return null;
@@ -341,7 +313,6 @@ function CustomerPortal({ toast, onBooked }) {
     const total = Math.round((BASE_FARE + distanceCharge + express) * 100) / 100;
     return { base: BASE_FARE, distanceCharge, express, total, estimatedRoadKm };
   }, [route, pickup, drop, priority]);
-
   /* ---- location setters ---- */
   const setLocation = (m, loc) => {
     if (m === "pickup") setPickup(loc);
@@ -351,7 +322,6 @@ function CustomerPortal({ toast, onBooked }) {
     setBooked(null);
     if (m === "pickup" && !drop) setMode("drop");
   };
-
   async function pickOnMap(latlng, m) {
     const { lat, lng } = latlng;
     const provisional = { lat, lng, name: "Locating address…", address: `${lat.toFixed(5)}, ${lng.toFixed(5)}` };
@@ -362,7 +332,6 @@ function CustomerPortal({ toast, onBooked }) {
     if (m === "pickup") setPickup(apply);
     else setDrop(apply);
   }
-
   async function search() {
     if (!query.trim()) {
       toast("Enter a place to search", "error");
@@ -372,7 +341,7 @@ function CustomerPortal({ toast, onBooked }) {
     setResults([]);
     try {
       const res = await fetch(
-        `https://nominatim.openstreetmap.org/search?format=jsonv2&q=${encodeURIComponent(query)}&limit=5&countrycodes=in`
+        `${API_BASE}/api/geocode?q=${encodeURIComponent(query)}`
       );
       if (!res.ok) throw new Error("Search failed");
       const data = await res.json();
@@ -385,7 +354,6 @@ function CustomerPortal({ toast, onBooked }) {
       setSearching(false);
     }
   }
-
   function chooseResult(r) {
     setLocation(mode, {
       lat: Number(r.lat),
@@ -395,7 +363,6 @@ function CustomerPortal({ toast, onBooked }) {
     });
     toast(mode === "pickup" ? "Pickup set" : "Drop-off set");
   }
-
   /* ---- route (auto when both points exist) ---- */
   useEffect(() => {
     setRouteError("");
@@ -440,7 +407,6 @@ function CustomerPortal({ toast, onBooked }) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pickup?.lat, pickup?.lng, drop?.lat, drop?.lng, routeTick]);
-
   /* ---- validation ---- */
   const errors = {};
   if (!pickup) errors.pickup = "Choose a pickup location.";
@@ -448,13 +414,11 @@ function CustomerPortal({ toast, onBooked }) {
   if (!item.trim()) errors.item = "Describe what is being delivered.";
   if (pickup && drop && !route && !routing && !routeError) errors.route = "Route is not ready yet.";
   const blocked = Object.keys(errors).length > 0 || !!routeError || routing;
-
   function tryBook() {
     setTouched(true);
     if (blocked) return;
     setConfirmOpen(true);
   }
-
   /* Adjust this payload if your POST /api/orders expects different field names. */
   const buildOrderPayload = () => ({
     pickupName: pickup.name,
@@ -471,7 +435,6 @@ function CustomerPortal({ toast, onBooked }) {
     distanceKm: Number(route.distance.toFixed(2)),
     etaMinutes: Math.round(route.duration),
   });
-
   async function confirmBooking() {
     setSubmitting(true);
     try {
@@ -492,7 +455,6 @@ function CustomerPortal({ toast, onBooked }) {
       setSubmitting(false);
     }
   }
-
   function resetAll() {
     setPickup(null);
     setDrop(null);
@@ -508,7 +470,6 @@ function CustomerPortal({ toast, onBooked }) {
     setResetOpen(false);
     toast("Delivery cleared");
   }
-
   const Stop = ({ kind, loc, label, err }) => (
     <button
       type="button"
@@ -526,7 +487,6 @@ function CustomerPortal({ toast, onBooked }) {
       {mode === kind && <span className="stop-state">Selecting</span>}
     </button>
   );
-
   return (
     <div className="cust">
       <aside className="cust-panel">
@@ -567,13 +527,11 @@ function CustomerPortal({ toast, onBooked }) {
             </div>
           )}
         </div>
-
         {/* stops */}
         <div className="stops">
           <Stop kind="pickup" loc={pickup} label="Pickup" err={errors.pickup} />
           <Stop kind="drop" loc={drop} label="Drop-off" err={errors.drop} />
         </div>
-
         {/* package */}
         <div className="field">
           <label htmlFor="pkg">Package</label>
@@ -583,7 +541,6 @@ function CustomerPortal({ toast, onBooked }) {
           </div>
           {touched && errors.item && <span className="field-error">{errors.item}</span>}
         </div>
-
         {/* priority */}
         <div className="field">
           <label>Delivery speed</label>
@@ -598,7 +555,6 @@ function CustomerPortal({ toast, onBooked }) {
             </button>
           </div>
         </div>
-
         {/* estimate */}
         <div className="estimate" aria-live="polite">
           {routing ? (
@@ -632,7 +588,6 @@ function CustomerPortal({ toast, onBooked }) {
             <p className="note">Select pickup and drop-off to see distance, time and fare.</p>
           )}
         </div>
-
         {booked ? (
           <div className="success-card">
             <strong>Order placed</strong>
@@ -650,7 +605,6 @@ function CustomerPortal({ toast, onBooked }) {
           </div>
         )}
       </aside>
-
       <section className="cust-map">
         <MapContainer center={DEFAULT_CENTER} zoom={11} scrollWheelZoom className="leaflet-map">
           <OsmTiles />
@@ -669,7 +623,6 @@ function CustomerPortal({ toast, onBooked }) {
           {route && <Polyline positions={route.coords} pathOptions={{ color: "#2646c8", weight: 6, opacity: 0.88 }} />}
           <FitView pickup={pickup} drop={drop} route={route} />
         </MapContainer>
-
         <div className="map-hint">
           <Crosshair size={16} />
           Click the map to set {mode === "pickup" ? "pickup" : "drop-off"}
@@ -680,7 +633,6 @@ function CustomerPortal({ toast, onBooked }) {
           <span><i style={{ background: "var(--route-opt)" }} /> Route</span>
         </div>
       </section>
-
       {confirmOpen && route && fare && (
         <Modal
           title="Confirm your booking"
@@ -702,7 +654,6 @@ function CustomerPortal({ toast, onBooked }) {
           <div className="summary-row summary-total num"><span>Total fare</span><strong>₹{fare.total}</strong></div>
         </Modal>
       )}
-
       {resetOpen && (
         <Modal
           title="Clear this delivery?"
@@ -720,17 +671,51 @@ function CustomerPortal({ toast, onBooked }) {
     </div>
   );
 }
-
 /* =====================================================
    RIDER APP
 ===================================================== */
-
 function RiderApp({ data, toast }) {
   const [orders, setOrders] = useState([]);
   const [ordersLoading, setOrdersLoading] = useState(false);
   const [riderError, setRiderError] = useState("");
   const [updating, setUpdating] = useState(null);
-
+  const [sharing, setSharing] = useState(false);
+  const watchRef = useRef(null);
+  const lastSent = useRef(0);
+  async function sendLocation(latitude, longitude, heading) {
+    try {
+      await fetch(`${API_BASE}/api/rider/location`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ latitude, longitude, ...(Number.isFinite(heading) ? { heading } : {}) }),
+      });
+    } catch { /* the next GPS fix retries */ }
+  }
+  function toggleGps() {
+    if (sharing) {
+      navigator.geolocation.clearWatch(watchRef.current);
+      watchRef.current = null;
+      setSharing(false);
+      return;
+    }
+    if (!navigator.geolocation) { toast("Geolocation is not supported on this device", "error"); return; }
+    watchRef.current = navigator.geolocation.watchPosition(
+      (pos) => {
+        if (Date.now() - lastSent.current < 5000) return; // throttle: one update / 5 s
+        lastSent.current = Date.now();
+        sendLocation(pos.coords.latitude, pos.coords.longitude, pos.coords.heading);
+      },
+      () => { toast("Location permission denied", "error"); setSharing(false); },
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 }
+    );
+    setSharing(true);
+    toast("Sharing live location");
+  }
+  useEffect(() => () => { if (watchRef.current != null) navigator.geolocation.clearWatch(watchRef.current); }, []);
+  async function useDemoLocation() {
+    await sendLocation(28.5355 + (Math.random() - 0.5) * 0.02, 77.391 + (Math.random() - 0.5) * 0.02);
+    toast("Demo rider placed in Noida");
+  }
   async function loadRiderOrders() {
     setOrdersLoading(true);
     setRiderError("");
@@ -745,15 +730,11 @@ function RiderApp({ data, toast }) {
       setOrdersLoading(false);
     }
   }
-
-
   useEffect(() => {
     loadRiderOrders();
     const timer = setInterval(loadRiderOrders, 15000);
     return () => clearInterval(timer);
   }, []);
-
-
   async function acceptOrder(order) {
     setUpdating(order.id);
     setRiderError("");
@@ -769,8 +750,6 @@ function RiderApp({ data, toast }) {
       setUpdating(null);
     }
   }
-
-
   async function advanceOrder(order) {
     const nextStatus = { ACCEPTED: "PICKED_UP", PICKED_UP: "IN_TRANSIT", IN_TRANSIT: "DELIVERED" }[order.status];
     if (!nextStatus) return;
@@ -792,17 +771,18 @@ function RiderApp({ data, toast }) {
       setUpdating(null);
     }
   }
-
-
   const activeOrders = orders.filter((o) => o.status !== "DELIVERED");
   const deliveredCount = orders.filter((o) => o.status === "DELIVERED").length;
-
   return (
     <>
       {riderError && <ErrorBanner message={riderError} onRetry={loadRiderOrders} />}
       <div className="toolbar" style={{ justifyContent: "space-between" }}>
         <div><strong>Rider Dashboard</strong><small className="note">Authentication disabled for demo</small></div>
-        <button className="btn btn-sm" onClick={loadRiderOrders} disabled={ordersLoading}><RefreshCw size={14} className={ordersLoading ? "spin" : ""} /> Refresh</button>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button className={`btn btn-sm ${sharing ? "btn-primary" : ""}`} onClick={toggleGps}><Crosshair size={14} /> {sharing ? "Stop sharing GPS" : "Share my GPS"}</button>
+          <button className="btn btn-sm" onClick={useDemoLocation}><MapPin size={14} /> Demo location</button>
+          <button className="btn btn-sm" onClick={loadRiderOrders} disabled={ordersLoading}><RefreshCw size={14} className={ordersLoading ? "spin" : ""} /> Refresh</button>
+        </div>
       </div>
       <div className="kpis">
         <Kpi label="Active deliveries" value={activeOrders.length} loading={ordersLoading} />
@@ -837,28 +817,23 @@ function RiderApp({ data, toast }) {
     </>
   );
 }
-
 /* =====================================================
    ADMIN — ORDERS & RIDERS
 ===================================================== */
-
 function AdminDashboard({ data }) {
   const { orders, riders, routes, loading, loaded, error, load } = data;
   const [q, setQ] = useState("");
   const [statusFilter, setStatusFilter] = useState("ALL");
   const [sort, setSort] = useState({ key: null, dir: "asc" });
   const [page, setPage] = useState(1);
-
   const riderName = useMemo(() => Object.fromEntries(riders.map((r) => [r.id, r.name || shortId(r.id)])), [riders]);
   const skeleton = loading && !loaded;
-
   const total = orders.length;
   const pending = orders.filter((o) => o.status === "PENDING").length;
   const active = orders.filter((o) => ["ACCEPTED", "ASSIGNED", "PICKED_UP", "IN_TRANSIT"].includes(o.status)).length;
   const delivered = orders.filter((o) => o.status === "DELIVERED").length;
   const busyIds = new Set(orders.filter((o) => ["ACCEPTED", "ASSIGNED", "PICKED_UP", "IN_TRANSIT"].includes(o.status)).map((o) => o.riderId));
   const available = riders.filter((r) => !busyIds.has(r.id)).length;
-
   const rows = useMemo(() => {
     const needle = q.trim().toLowerCase();
     let list = orders.filter((o) => {
@@ -874,22 +849,18 @@ function AdminDashboard({ data }) {
     }
     return list;
   }, [orders, q, statusFilter, sort, riderName]);
-
   const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
   const cur = Math.min(page, pages);
   const visible = rows.slice((cur - 1) * PAGE_SIZE, cur * PAGE_SIZE);
-
   const toggleSort = (key) => setSort((s) => (s.key === key ? { key, dir: s.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" }));
   const SortTh = ({ k, children }) => (
     <th aria-sort={sort.key === k ? (sort.dir === "asc" ? "ascending" : "descending") : "none"}>
       <button onClick={() => toggleSort(k)}>{children}<ArrowUpDown size={13} /></button>
     </th>
   );
-
   return (
     <>
       <ErrorBanner message={error} onRetry={() => load()} />
-
       <div className="kpis">
         <Kpi label="Total orders" value={total} loading={skeleton} />
         <Kpi label="Pending" value={pending} loading={skeleton} />
@@ -898,7 +869,6 @@ function AdminDashboard({ data }) {
         <Kpi label="Available riders" value={available} hint={`of ${riders.length}`} loading={skeleton} />
         <Kpi label="Route distance" value={fmtKm(routes?.optimizedDistance)} hint="Optimized, active orders" loading={skeleton} />
       </div>
-
       <div className="two-col">
         <section className="card">
           <div className="card-head">
@@ -916,7 +886,6 @@ function AdminDashboard({ data }) {
               </div>
             </div>
           </div>
-
           {skeleton ? (
             <div className="card-body" style={{ display: "grid", gap: 10 }}>
               {[0, 1, 2, 3].map((i) => <div key={i} className="skeleton" style={{ height: 44 }} />)}
@@ -969,7 +938,6 @@ function AdminDashboard({ data }) {
             </>
           )}
         </section>
-
         <section className="card">
           <div className="card-head"><div><h2>Riders</h2><p>{riders.length} in fleet</p></div></div>
           {skeleton ? (
@@ -1000,39 +968,57 @@ function AdminDashboard({ data }) {
     </>
   );
 }
-
 /* =====================================================
    RESEARCH DASHBOARD
 ===================================================== */
-
 function groupExperiments(history) {
   const map = new Map();
   history.forEach((r, i) => {
-    const key = r.experimentId ?? `${r.batchSize}-${r.id ?? i}`;
+    const key = r.experimentId ? `${r.experimentId}#${r.seed}` : `${r.batchSize}-${r.id ?? i}`;
     if (!map.has(key)) map.set(key, { id: key, batchSize: r.batchSize, createdAt: r.createdAt });
     const e = map.get(key);
-    if (String(r.algorithm || "").toUpperCase().startsWith("FIFO")) e.fifo = r;
+    const alg = String(r.algorithm || "").toUpperCase();
+    if (alg.startsWith("FIFO")) e.fifo = r;
+    else if (alg === "EXACT") e.exact = r;
     else e.opt = r;
   });
   const list = [...map.values()];
   if (list.length && list.every((e) => e.createdAt)) list.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   return list;
 }
-
 function ResearchDashboard({ data, toast }) {
   const { routes, history, loading, loaded, error, load } = data;
   const [running, setRunning] = useState(null);
   const [runError, setRunError] = useState("");
-
+  const [study, setStudy] = useState(null);
+  const [studyRunning, setStudyRunning] = useState(false);
+  async function runStudy(size, trials = 30) {
+    setStudyRunning(true);
+    setRunError("");
+    try {
+      const res = await fetch(`${API_BASE}/api/benchmark`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ size, trials, matrix: "haversine" }),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(d.error || "Study failed");
+      setStudy(d);
+      await load(true);
+      toast(`${trials}-trial study completed`);
+    } catch (e) {
+      setRunError(e.message || "Study could not be completed");
+    } finally {
+      setStudyRunning(false);
+    }
+  }
   const experiments = useMemo(() => groupExperiments(history), [history]);
   const complete = experiments.filter((e) => e.fifo && e.opt);
   const latest = complete[0];
   const latestPct = latest ? reductionPct(latest.fifo.distanceKm, latest.opt.distanceKm) : null;
-
   const livePct = reductionPct(routes?.fifoDistance, routes?.optimizedDistance);
   const saved = Number.isFinite(routes?.optimizedDistance) && Number.isFinite(routes?.fifoDistance) ? routes.fifoDistance - routes.optimizedDistance : null;
   const hasGeometry = routes?.optimizedGeometry?.length && routes?.fifoGeometry?.length;
-
   async function run(size) {
     setRunning(size);
     setRunError("");
@@ -1052,12 +1038,10 @@ function ResearchDashboard({ data, toast }) {
       setRunning(null);
     }
   }
-
   const chartRows = complete.slice(0, 8);
   const maxKm = Math.max(1, ...chartRows.flatMap((e) => [Number(e.fifo.distanceKm) || 0, Number(e.opt.distanceKm) || 0]));
   const maxMs = Math.max(1, ...chartRows.flatMap((e) => [Number(e.fifo.computeMs) || 0, Number(e.opt.computeMs) || 0]));
   const skeleton = loading && !loaded;
-
   const Bars = ({ metric, max, fmt }) => (
     <div className="bars">
       {chartRows.map((e) => (
@@ -1071,18 +1055,15 @@ function ResearchDashboard({ data, toast }) {
       ))}
     </div>
   );
-
   const keyLegend = (
     <div className="legend inline">
       <span><i style={{ background: "var(--route-opt)" }} /> Optimized</span>
       <span><i className="dash" /> FIFO baseline</span>
     </div>
   );
-
   return (
     <>
       <ErrorBanner message={error} onRetry={() => load()} />
-
       {/* live comparison */}
       <section className="card">
         <div className="card-head">
@@ -1114,7 +1095,6 @@ function ResearchDashboard({ data, toast }) {
           )}
         </div>
       </section>
-
       {/* benchmark */}
       <section className="card">
         <div className="card-head">
@@ -1126,15 +1106,32 @@ function ResearchDashboard({ data, toast }) {
                 {running === n ? "Running…" : `${n} orders`}
               </button>
             ))}
+            <button className="btn" disabled={running !== null || studyRunning} onClick={() => runStudy(25)}>
+              {studyRunning ? <Loader2 size={15} className="spin" /> : <FlaskConical size={15} />} 30-trial study (25 orders)
+            </button>
             <a className="btn" href={`${API_BASE}/api/benchmark.csv`}><Download size={15} /> Export CSV</a>
           </div>
         </div>
         <div className="card-body" style={{ display: "grid", gap: 16 }}>
           {runError && <ErrorBanner message={runError} />}
+          {study?.summary && (
+            <div className="card" style={{ padding: 16 }}>
+              <strong>Statistical study: {study.trials} independent seeds, {study.batchSize} orders</strong>
+              <div className="note" style={{ marginTop: 6 }}>
+                Distance saved vs FIFO: <b>{study.summary.distanceSavedPct.mean.toFixed(1)}%</b> mean
+                (95% CI {study.summary.distanceSavedPct.ci95.low.toFixed(1)} to {study.summary.distanceSavedPct.ci95.high.toFixed(1)}%,
+                SD {study.summary.distanceSavedPct.stddev.toFixed(1)}).
+                {study.summary.pairedTTest && (
+                  <> Paired t = {study.summary.pairedTTest.t.toFixed(2)} (df {study.summary.pairedTTest.df}),{" "}
+                  {study.summary.pairedTTest.significant ? "significant at the 5% level" : "not significant at the 5% level"}.</>
+                )}
+                {" "}Mean optimiser runtime {study.summary.optimizedComputeMs.mean.toFixed(1)} ms. Matrix: {study.matrixSource}.
+              </div>
+            </div>
+          )}
           {running !== null && (
             <div className="alert info"><Loader2 size={17} className="spin" /><span>Running {running}-order benchmark. This can take a while because it requests a route matrix.</span></div>
           )}
-
           {skeleton ? (
             <div className="skeleton" style={{ height: 120 }} />
           ) : latest ? (
@@ -1149,7 +1146,6 @@ function ResearchDashboard({ data, toast }) {
           ) : (
             <Empty icon={FlaskConical} title="No benchmark runs saved" text="Pick a batch size above to run your first experiment." />
           )}
-
           {chartRows.length > 0 && (
             <div className="two-col" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))" }}>
               <div style={{ display: "grid", gap: 12 }}>
@@ -1166,7 +1162,6 @@ function ResearchDashboard({ data, toast }) {
           )}
         </div>
       </section>
-
       {/* history */}
       <section className="card">
         <div className="card-head"><div><h2>Benchmark history</h2><p>{complete.length} saved experiments</p></div></div>
@@ -1210,31 +1205,25 @@ function ResearchDashboard({ data, toast }) {
     </>
   );
 }
-
 /* =====================================================
    APP SHELL
 ===================================================== */
-
 const VIEWS = [
   { id: "customer", label: "Customer", title: "Book a delivery", sub: "Choose pickup and drop-off, see the route and fare.", icon: Package },
   { id: "rider", label: "Rider", title: "Rider app", sub: "Your assigned deliveries and the next action for each.", icon: Truck },
   { id: "admin", label: "Orders", title: "Operations", sub: "Orders and riders across the fleet.", icon: LayoutDashboard },
   { id: "research", label: "Research", title: "Route optimization research", sub: "Optimized routing compared with the FIFO baseline.", icon: FlaskConical },
 ];
-
 export default function App() {
   const initial = VIEWS.find((v) => `#${v.id}` === window.location.hash)?.id || "customer";
   const [view, setView] = useState(initial);
   const [toasts, setToasts] = useState([]);
-
   const data = useBackend(true);
-
   const toast = useCallback((message, type = "success") => {
     const id = Date.now() + Math.random();
     setToasts((t) => [...t, { id, message, type }]);
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3500);
   }, []);
-
   useEffect(() => {
     const onHash = () => {
       const v = VIEWS.find((x) => `#${x.id}` === window.location.hash);
@@ -1243,15 +1232,12 @@ export default function App() {
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
-
   const go = (id) => {
     setView(id);
     window.history.replaceState(null, "", `#${id}`);
   };
-
   const current = VIEWS.find((v) => v.id === view);
   const backendView = true;
-
   return (
     <div className="shell">
       <aside className="sidebar">
@@ -1268,7 +1254,6 @@ export default function App() {
         </nav>
         <div className="sidebar-foot">B.Tech final-year project</div>
       </aside>
-
       <div className="content">
         <header className="topbar">
           <div>
@@ -1284,7 +1269,6 @@ export default function App() {
             <span className={`live ${backendView && data.error ? "off" : ""}`}><i />{backendView && data.error ? "Backend offline" : "Live"}</span>
           </div>
         </header>
-
         <main className={`page ${view === "customer" ? "flush" : ""}`}>
           {view === "customer" && <CustomerPortal toast={toast} onBooked={() => data.load(true)} />}
           {view === "rider" && <RiderApp data={data} toast={toast} />}
@@ -1292,7 +1276,6 @@ export default function App() {
           {view === "research" && <ResearchDashboard data={data} toast={toast} />}
         </main>
       </div>
-
       <nav className="bottom-nav" aria-label="Main">
         {VIEWS.map(({ id, label, icon: Icon }) => (
           <button key={id} className={view === id ? "active" : ""} onClick={() => go(id)}>
@@ -1301,7 +1284,6 @@ export default function App() {
           </button>
         ))}
       </nav>
-
       <Toasts items={toasts} />
     </div>
   );
