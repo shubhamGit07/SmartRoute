@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: smartroute-api
+    runtime: node
+    rootDir: server
+    buildCommand: npm install && npx prisma generate
+    startCommand: npm run start
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: CLIENT_URL
+        sync: false
+      - key: OSRM_BASE
+        value: https://router.project-osrm.org
+      - key: NOMINATIM_BASE
+        value: https://nominatim.openstreetmap.org
