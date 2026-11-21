@@ -288,12 +288,17 @@ app.patch('/api/rider/orders/:id/status', writeLimiter, async (req, res, next) =
     const allowed: Record<string, string[]> = { ACCEPTED: ['PICKED_UP'], PICKED_UP: ['IN_TRANSIT'], IN_TRANSIT: ['DELIVERED'] };
     if (!(allowed[order.status] || []).includes(next_)) return apiError(res, 409, `Cannot move order from ${order.status} to ${next_}.`);
     const updated = await prisma.$transaction(async (tx) => {
-      const u = await tx.order.update({ where: { id: order.id }, data: { status: next_, ...statusTimestamps(next_) } });
+      const u = await tx.order.updateMany({
+        where: { id: order.id, riderId: rider.id, status: order.status },
+        data: { status: next_, ...statusTimestamps(next_) },
+      });
+      if (u.count === 0) return null;
       await tx.deliveryEvent.create({
         data: { orderId: order.id, status: next_, description: `Order status changed to ${next_}`, actor: 'RIDER_DEMO', latitude: rider.latitude ?? null, longitude: rider.longitude ?? null },
       });
-      return u;
+      return tx.order.findUnique({ where: { id: order.id } });
     });
+    if (!updated) return apiError(res, 409, 'Order status changed concurrently. Refresh and try again.');
     schedulePush();
     io.emit('order:status', updated);
     res.json(updated);
@@ -310,7 +315,7 @@ app.patch('/api/rider/location', rateLimit({ windowMs: 60_000, limit: 120 }), as
     const demo = await getDemoRider();
     const rider = await prisma.rider.update({
       where: { id: demo.id },
-      data: { latitude, longitude, available: true, ...(isFiniteNumber(heading) ? { heading } : {}), lastSeen: new Date() },
+      data: { latitude, longitude, ...(isFiniteNumber(heading) ? { heading } : {}), lastSeen: new Date() },
     });
     io.emit('rider:location', { id: rider.id, latitude, longitude, heading: rider.heading });
     schedulePush();
@@ -477,36 +482,77 @@ app.get('/api/benchmark.csv', async (_req, res, next) => {
 /* Geocoding proxy (cached, rate-limited, proper User-Agent)           */
 /* ------------------------------------------------------------------ */
 const NOMINATIM = () => (process.env.NOMINATIM_BASE || 'https://nominatim.openstreetmap.org').replace(/\/$/, '');
+const PHOTON = () => (process.env.PHOTON_BASE || 'https://photon.komoot.io').replace(/\/$/, '');
 const UA = () => process.env.NOMINATIM_USER_AGENT || 'SmartRouteCapstone/2.0 (student project)';
 const geoCache = new Map<string, { at: number; data: unknown }>();
 const GEO_TTL = 60 * 60 * 1000;
-async function cachedFetch(key: string, url: string) {
+async function fetchGeoJson(url: string) {
+  const r = await fetch(url, { headers: { 'User-Agent': UA(), 'Accept-Language': 'en' }, signal: AbortSignal.timeout(8000) });
+  if (!r.ok) throw new Error(`Geocoder HTTP ${r.status}`);
+  return r.json();
+}
+function photonLabel(props: any) {
+  return [props.name, props.street, props.housenumber, props.postcode, props.city || props.locality, props.state, props.country]
+    .filter(Boolean).join(', ');
+}
+function photonSearchToNominatim(data: any) {
+  return (data?.features || []).map((f: any) => ({
+    place_id: f.properties?.osm_id,
+    name: f.properties?.name || f.properties?.street || f.properties?.city || f.properties?.locality || 'Place',
+    display_name: photonLabel(f.properties || {}),
+    lat: String(f.geometry?.coordinates?.[1] ?? ''),
+    lon: String(f.geometry?.coordinates?.[0] ?? ''),
+    address: f.properties || {},
+  })).filter((x: any) => x.lat && x.lon && x.display_name);
+}
+function photonReverseToNominatim(data: any, lat: number, lng: number) {
+  const f = data?.features?.[0];
+  if (!f) return { display_name: `${lat.toFixed(5)}, ${lng.toFixed(5)}`, lat: String(lat), lon: String(lng), address: {} };
+  const props = f.properties || {};
+  return { display_name: photonLabel(props) || `${lat.toFixed(5)}, ${lng.toFixed(5)}`, lat: String(lat), lon: String(lng), address: props };
+}
+async function cachedFetch(key: string, fetcher: () => Promise<unknown>) {
   const hit = geoCache.get(key);
   if (hit && Date.now() - hit.at < GEO_TTL) return hit.data;
-  const r = await fetch(url, { headers: { 'User-Agent': UA(), 'Accept-Language': 'en' }, signal: AbortSignal.timeout(8000) });
-  if (!r.ok) throw Object.assign(new Error('geocoder'), { status: 502 });
-  const data = await r.json();
+  const data = await fetcher();
   if (geoCache.size > 500) geoCache.delete(geoCache.keys().next().value as string);
   geoCache.set(key, { at: Date.now(), data });
   return data;
 }
-
+async function geocodeWithFallback(q: string) {
+  try {
+    return await fetchGeoJson(`${NOMINATIM()}/search?format=jsonv2&limit=5&countrycodes=in&q=${encodeURIComponent(q)}`);
+  } catch (primaryError) {
+    console.warn('Nominatim search failed; trying Photon fallback:', (primaryError as Error).message);
+    const photon = await fetchGeoJson(`${PHOTON()}/api/?q=${encodeURIComponent(q)}&limit=5&lang=en`);
+    return photonSearchToNominatim(photon);
+  }
+}
+async function reverseWithFallback(lat: number, lng: number) {
+  try {
+    return await fetchGeoJson(`${NOMINATIM()}/reverse?format=jsonv2&lat=${lat}&lon=${lng}`);
+  } catch (primaryError) {
+    console.warn('Nominatim reverse failed; trying Photon fallback:', (primaryError as Error).message);
+    const photon = await fetchGeoJson(`${PHOTON()}/reverse?lat=${lat}&lon=${lng}&lang=en`);
+    return photonReverseToNominatim(photon, lat, lng);
+  }
+}
 app.get('/api/geocode', geoLimiter, async (req, res, next) => {
   try {
     const q = String(req.query.q ?? '').trim();
     if (q.length < 3) return res.json([]);
     if (q.length > 200) return apiError(res, 400, 'Search query is too long.');
-    res.json(await cachedFetch(`s:${q.toLowerCase()}`, `${NOMINATIM()}/search?format=jsonv2&limit=5&countrycodes=in&q=${encodeURIComponent(q)}`));
-  } catch (e: any) { e?.status === 502 ? apiError(res, 502, 'Geocoding service returned an error.') : next(e); }
+    res.json(await cachedFetch(`s:${q.toLowerCase()}`, () => geocodeWithFallback(q)));
+  } catch (e: any) { console.error('Geocoding providers failed:', e?.message); apiError(res, 502, 'Geocoding is temporarily unavailable. Please click the map to select a location.'); }
 });
-
 app.get('/api/reverse', geoLimiter, async (req, res, next) => {
   try {
     const lat = Number(req.query.lat), lng = Number(req.query.lng);
     if (!validCoordinate(lat, lng)) return apiError(res, 400, 'Valid lat and lng are required.');
-    res.json(await cachedFetch(`r:${lat.toFixed(4)},${lng.toFixed(4)}`, `${NOMINATIM()}/reverse?format=jsonv2&lat=${lat}&lon=${lng}`));
-  } catch (e: any) { e?.status === 502 ? apiError(res, 502, 'Geocoding service returned an error.') : next(e); }
+    res.json(await cachedFetch(`r:${lat.toFixed(4)},${lng.toFixed(4)}`, () => reverseWithFallback(lat, lng)));
+  } catch (e: any) { console.error('Reverse geocoding providers failed:', e?.message); apiError(res, 502, 'Reverse geocoding is temporarily unavailable.'); }
 });
+
 
 /* ------------------------------------------------------------------ */
 /* Socket.io                                                           */

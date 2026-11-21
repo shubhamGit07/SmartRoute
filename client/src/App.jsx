@@ -771,7 +771,7 @@ function RiderApp({ data, toast }) {
       setUpdating(null);
     }
   }
-  const activeOrders = orders.filter((o) => o.status !== "DELIVERED");
+  const activeOrders = orders.filter((o) => !["DELIVERED", "CANCELLED"].includes(o.status));
   const deliveredCount = orders.filter((o) => o.status === "DELIVERED").length;
   return (
     <>

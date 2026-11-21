@@ -41,4 +41,6 @@ console.log("drop-only orders OK, stops:", m.sequence.length);
 // timing for 50 orders (100 stops)
 const big = gen(7, 50); const t0 = performance.now();
 const b = await optimizeStops(start, big, { forceHaversine: true });
+assert.ok(precedenceOk(b.sequence), "50-order stress test violated pickup/drop precedence");
+assert.equal(b.sequence.length, big.length, "50-order optimizer must include every stop");
 console.log("50 orders:", b.distanceKm.toFixed(1), "km in", (performance.now() - t0).toFixed(0), "ms", precedenceOk(b.sequence));
