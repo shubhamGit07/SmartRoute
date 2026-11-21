@@ -1240,6 +1240,10 @@ export default function App() {
   const backendView = true;
   return (
     <div className="shell">
+      <style>{`
+        .research-page { overflow-y: auto !important; overflow-x: hidden !important; min-height: 0 !important; }
+        .research-page > * { flex-shrink: 0 !important; }
+      `}</style>
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark"><Route size={19} /></div>
@@ -1269,7 +1273,7 @@ export default function App() {
             <span className={`live ${backendView && data.error ? "off" : ""}`}><i />{backendView && data.error ? "Backend offline" : "Live"}</span>
           </div>
         </header>
-        <main className={`page ${view === "customer" ? "flush" : ""}`}>
+        <main className={`page ${view === "customer" ? "flush" : ""} ${view === "research" ? "research-page" : ""}`}>
           {view === "customer" && <CustomerPortal toast={toast} onBooked={() => data.load(true)} />}
           {view === "rider" && <RiderApp data={data} toast={toast} />}
           {view === "admin" && <AdminDashboard data={data} />}
